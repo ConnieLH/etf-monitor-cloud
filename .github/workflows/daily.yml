@@ -1,0 +1,99 @@
+name: daily-report
+
+on:
+  schedule:
+    # 避开整点拥堵并重试：北京时间 17:07、17:27、18:07、19:47
+    - cron: '7,27 9 * * 1-5'
+    - cron: '7 10 * * 1-5'
+    - cron: '47 11 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  # contents: write 用于把 history/ 的每日数据提交回仓库。
+  # 这些提交同时算作仓库活动，避免公开仓库 60 天无活动后定时任务被 GitHub 自动停用。
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Generate report
+        run: python three_index_report.py --start-date 2020-01-01 --output-dir output --history-dir history
+
+      - name: Upload freshness diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-freshness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/source_freshness.json
+          if-no-files-found: warn
+          overwrite: true
+
+      - name: Check for new data
+        id: changes
+        run: |
+          git add -A history
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "history/ 没有新数据：今天的报告已经发布过，本次跳过部署。"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare site
+        if: steps.changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p site
+          cp output/report.html site/index.html
+          cp output/data_snapshot.json site/data_snapshot.json
+
+      - name: Setup Pages
+        if: steps.changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        if: steps.changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # 只发布报告本身，不把源码、测试和 README 一起公开到网页上。
+          path: site
+
+      - name: Deploy to GitHub Pages
+        if: steps.changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # 部署成功后再提交历史：如果部署失败，下一次定时运行仍会看到“有新数据”并重新部署。
+      - name: Commit history
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          DATA_DATE=$(python -c "import json;print(json.load(open('output/data_snapshot.json'))['data_cutoff'])")
+          git commit -m "data: ${DATA_DATE} 每日快照"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
