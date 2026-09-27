@@ -230,7 +230,7 @@ class ReportIntegrationTests(unittest.TestCase):
         turnover = self.turnover_frame()
         with tempfile.TemporaryDirectory() as temp_dir, patch(
             "three_index_report.fetch_csi_index_data",
-            side_effect=lambda *_args: (price.copy(), valuation.copy()),
+            side_effect=lambda *_args, **_kwargs: (price.copy(), valuation.copy()),
         ), patch(
             "three_index_report.fetch_tencent_kline", side_effect=lambda *_args: turnover.copy()
         ), patch(
@@ -278,7 +278,7 @@ class ReportIntegrationTests(unittest.TestCase):
         valuation = self.valuation_frame()
         turnover = self.turnover_frame()
 
-        def index_data_for_code(_session, code, *_args):
+        def index_data_for_code(_session, code, *_args, **_kwargs):
             selected_price = price.iloc[:-1].copy() if code == "000688" else price.copy()
             return selected_price, valuation.copy()
 
@@ -317,7 +317,7 @@ class ReportIntegrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temp_dir, patch(
             "three_index_report.fetch_csi_index_data",
-            side_effect=lambda *_args: (price.copy(), valuation.copy()),
+            side_effect=lambda *_args, **_kwargs: (price.copy(), valuation.copy()),
         ), patch(
             "three_index_report.fetch_tencent_kline", side_effect=lambda *_args: turnover.copy()
         ), patch(
