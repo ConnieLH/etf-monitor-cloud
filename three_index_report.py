@@ -24,7 +24,7 @@ import requests
 
 from fund_monitor import (ChartTimeAxis, build_chart_time_axis, validate_chart_time_axis,
                           compute_metrics, fmt_num, fmt_pct, summarize, svg_fr_chart, svg_kline_chart)
-from signal_rules import signal_status, weekly_bars
+from signal_rules import replay, signal_status, weekly_bars
 
 
 INDEXES: Dict[str, Dict[str, str]] = {
@@ -239,7 +239,8 @@ def fetch_csi_perf_history(session: requests.Session, code: str, start: str, end
     return frame.sort_values("tradeDate").reset_index(drop=True)
 
 
-def csi_kline_from_perf(frame: pd.DataFrame, code: str) -> pd.DataFrame:
+def csi_kline_from_perf(frame: pd.DataFrame, code: str, *,
+                        include_close_only: bool = False) -> pd.DataFrame:
     """Convert CSI performance rows to the report's OHLC schema."""
 
     result = pd.DataFrame(
@@ -255,7 +256,8 @@ def csi_kline_from_perf(frame: pd.DataFrame, code: str) -> pd.DataFrame:
             "change": pd.to_numeric(frame.get("change"), errors="coerce"),
         }
     )
-    result = result.dropna(subset=["date", "open", "close", "high", "low"])
+    required = ["date", "close"] if include_close_only else ["date", "open", "close", "high", "low"]
+    result = result.dropna(subset=required)
     prev_close = result["close"].shift(1)
     result["amplitude_pct"] = (result["high"] - result["low"]) / prev_close * 100
     result["turnover_pct"] = float("nan")
@@ -331,11 +333,12 @@ def fetch_csi_index_data(
     code: str,
     start: str,
     end: str,
+    *, include_close_only: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Fetch and parse price plus valuation with one cache-safe request sequence."""
 
     frame = fetch_csi_perf_history(session, code, start, end)
-    return csi_kline_from_perf(frame, code), csi_pe_from_perf(frame, code)
+    return csi_kline_from_perf(frame, code, include_close_only=include_close_only), csi_pe_from_perf(frame, code)
 
 
 def normalize_shanghai_now(now: datetime) -> datetime:
@@ -1331,7 +1334,8 @@ def price_levels(summary: Dict[str, Any], sig: Dict[str, Any]) -> List[Tuple[flo
 def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, str, str]],
                        width: int = 1060, height: int = 380, *,
                        axis: Optional[ChartTimeAxis] = None,
-                       ma_periods: Tuple[int, int] = (20, 60)) -> str:
+                       ma_periods: Tuple[int, int] = (20, 60),
+                       events: Optional[List[Dict[str, Any]]] = None) -> str:
     """Candles and period moving averages with the shared pair's exact dates."""
 
     plot = (df if axis is not None else df.tail(250)).reset_index(drop=True)
@@ -1344,11 +1348,12 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
     cw, chh = width - left - right, height - top - bottom
     axis = axis or build_chart_time_axis(plot["date"], width, left, right)
     xs = axis.xs
-    lo, hi = float(plot["low"].min()), float(plot["high"].max())
+    lo = float(plot[["low", "close"]].min().min())
+    hi = float(plot[["high", "close"]].max().max())
     for value, _, _ in levels:
         if lo * 0.8 <= value <= hi * 1.2:
             lo, hi = min(lo, value), max(hi, value)
-    pad = (hi - lo) * 0.04 or 1.0
+    pad = (hi - lo) * (0.10 if events else 0.04) or 1.0
     lo, hi = lo - pad, hi + pad
 
     def sy(v: float) -> float:
@@ -1364,6 +1369,10 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         parts.append(f'<text x="6" y="{y + 4:.1f}" font-size="11" fill="#6b7280">{hi - frac * (hi - lo):.0f}</text>')
     for x, (_, row) in zip(xs, plot.iterrows()):
         o, c, h, l = float(row["open"]), float(row["close"]), float(row["high"]), float(row["low"])
+        if not all(math.isfinite(v) for v in (o, h, l)):
+            # A close-only month is not an OHLC candle; never invent its range.
+            parts.append(f'<circle class="close-only" cx="{x:.1f}" cy="{sy(c):.1f}" r="2.5" fill="#94a3b8"><title>仅有收盘价，开高低数据不完整</title></circle>')
+            continue
         color = "#dc2626" if c >= o else "#16a34a"
         parts.append(f'<line x1="{x:.1f}" y1="{sy(h):.1f}" x2="{x:.1f}" y2="{sy(l):.1f}" stroke="{color}" stroke-width="1.1"/>')
         top_y = min(sy(o), sy(c))
@@ -1383,12 +1392,43 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         label_ys.append(ly)
         parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + cw}" y2="{y:.1f}" stroke="{color}" stroke-width="1.2" stroke-dasharray="6 4"/>')
         parts.append(f'<text x="{left + cw + 6}" y="{ly:.1f}" font-size="11" fill="{color}">{escape(label)}</text>')
+    # Labels are admitted only when their boxes do not touch a neighbouring
+    # marker or label. The triangle is always retained at its exact week.
+    positions = {pd.Timestamp(d): i for i, d in enumerate(plot["date"])}
+    markers = []
+    for event in events or []:
+        i = positions.get(pd.Timestamp(event["date"]))
+        if i is None:
+            continue
+        buy = event["direction"] == "buy"
+        row = plot.iloc[i]
+        x = xs[i]
+        y = sy(float(row["low"] if buy else row["high"])) + (12 if buy else -12)
+        markers.append((event, x, y, buy))
+    labels_used = []
+    def overlaps(a, b):
+        return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+    for event, x, y, buy in markers:
+        color = "#dc2626" if buy else "#16a34a"
+        points = (f"{x:.1f},{y - 5:.1f} {x - 5:.1f},{y + 4:.1f} {x + 5:.1f},{y + 4:.1f}" if buy
+                  else f"{x:.1f},{y + 5:.1f} {x - 5:.1f},{y - 4:.1f} {x + 5:.1f},{y - 4:.1f}")
+        label = event["label"]
+        parts.append(f'<g class="signal-marker" data-date="{event["date"]:%Y-%m-%d}" data-direction="{event["direction"]}" data-factor="{event["factor"]}">'
+                     f'<title>{event["date"]:%Y-%m-%d} {escape(event["reason"])}；下一个交易日执行</title>'
+                     f'<polygon points="{points}" fill="{color}"/>')
+        box = (x + 8, y - 8, x + 8 + 11 * len(label), y + 7)
+        occupied = [(mx - 7, my - 7, mx + 7, my + 7) for _, mx, my, _ in markers]
+        if box[2] <= left + cw and not any(overlaps(box, other) for other in occupied + labels_used):
+            parts.append(f'<text x="{x + 8:.1f}" y="{y + 4:.1f}" font-size="11" fill="{color}">{label}</text>')
+            labels_used.append(box)
+        parts.append('</g>')
     last_x, last_close = xs[-1], float(plot["close"].iloc[-1])
     parts.append(f'<circle cx="{last_x:.1f}" cy="{sy(last_close):.1f}" r="3.5" fill="#111827"/>')
     for i in axis.ticks:
         label = plot.loc[i, "date"].strftime("%Y-%m") if i != len(plot) - 1 else plot.loc[i, "date"].strftime("%Y-%m-%d")
         parts.append(f'<text x="{xs[i]:.1f}" y="{height - 8}" font-size="11" fill="#6b7280" text-anchor="middle">{label}</text>')
-    ly = 52
+    ly = 54
+    parts.append(f'<rect class="ma-legend-bg" x="{left - 2}" y="{ly - 12}" width="148" height="23" rx="4" fill="#ffffff"/>')
     parts.append(f'<rect x="{left}" y="{ly}" width="12" height="3" fill="#2563eb"/><text x="{left + 18}" y="{ly + 4}" font-size="12" fill="#374151">MA{ma_periods[0]}</text>')
     parts.append(f'<rect x="{left + 70}" y="{ly}" width="12" height="3" fill="#f59e0b"/><text x="{left + 88}" y="{ly + 4}" font-size="12" fill="#374151">MA{ma_periods[1]}</text>')
     parts.append("</svg>")
@@ -1408,7 +1448,7 @@ def build_date_tick_positions_local(plot: pd.DataFrame, max_ticks: int = 8) -> L
     return sorted(set(starts + [len(plot) - 1]))
 
 
-MONTHLY_CHART_STARTS = {"000510": "2010-01-01"}
+MONTHLY_CHART_STARTS = {"000510": "2010-01-01", "930955": "2006-01-04"}
 
 CHART_PERIODS = {
     "day": ("日", 250, (20, 60)),
@@ -1426,7 +1466,8 @@ def aggregate_ohlc(daily: pd.DataFrame, period: str) -> pd.DataFrame:
     frame["period"] = frame["date"].dt.to_period("W-SUN" if period == "week" else "M")
     return frame.groupby("period", sort=True).agg(
         date=("date", "last"), open=("open", lambda values: values.iloc[0]),
-        high=("high", "max"), low=("low", "min"), close=("close", "last"),
+        high=("high", lambda values: values.max() if values.notna().all() else np.nan),
+        low=("low", lambda values: values.min() if values.notna().all() else np.nan), close=("close", "last"),
     ).reset_index(drop=True)
 
 
@@ -1447,11 +1488,37 @@ def period_chart_frames(prices: pd.DataFrame,
     return {"day": compute_metrics(daily), "week": weekly, "month": monthly}
 
 
+def historical_signal_events(price: pd.DataFrame, sig: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Replay exactly the completed weekly prefix selected by signal_status."""
+    if not sig or "error" in sig or not sig.get("week_date"):
+        return []
+    weekly = weekly_bars(price)
+    confirmed = weekly[weekly["date"] <= pd.Timestamp(sig["week_date"])].reset_index(drop=True)
+    events, previous = [], 1.0  # SignalState's initial factor; no invented buy.
+    for event in replay(confirmed).events:
+        factor = event["factor"]
+        if factor != previous:
+            buy = factor > previous
+            label = ("抄底半仓" if factor == 0.5 else "买") if buy else ("止损" if "止损" in event["reason"] else "卖")
+            events.append(dict(event, direction="buy" if buy else "sell", label=label))
+        previous = factor
+    return events
+
+
+def fr_display_frame(full: pd.DataFrame, count: int) -> pd.DataFrame:
+    """Mask the first 26 observations, preserving their date/axis slots."""
+    shown = full.copy()
+    shown.loc[shown.index[:26], ["fr", "fr_bar"]] = np.nan
+    return shown.tail(count).reset_index(drop=True)
+
+
 def period_chart_pair(code: str, name: str, price: pd.DataFrame,
                       summary: Dict[str, Any], sig: Dict[str, Any],
                       monthly_prices: Optional[pd.DataFrame] = None) -> str:
     frames = period_chart_frames(price, monthly_prices)
     inputs, labels, panels = [], [], []
+    events = historical_signal_events(price, sig)
+    weekly_reading = read_kline(summary, sig, frames["week"], period="week")
     for key, (unit, count, ma_periods) in CHART_PERIODS.items():
         disabled = key == "month" and len(frames[key]) < 48
         radio_id = f"period-{code}-{key}"
@@ -1470,7 +1537,8 @@ def period_chart_pair(code: str, name: str, price: pd.DataFrame,
                  f"蓝线是{ma_periods[0]}{unit}均线，橙线是{ma_periods[1]}{unit}均线，均线用完整历史计算。",
                  HOWTO_KLINE[2], HOWTO_KLINE[3]]
         if key == "week":
-            how_fr = HOWTO_WEEKLY
+            how_k.append("▲▼是按规则历史上的买卖点，标在信号确认的那一周，下一个交易日执行。")
+            how_fr = list(HOWTO_WEEKLY)
             reading = read_weekly_fr(sig, frames[key])
         else:
             how_fr = [f"每根柱子代表一{unit}，与上面的{unit}K逐根对应。",
@@ -1482,14 +1550,23 @@ def period_chart_pair(code: str, name: str, price: pd.DataFrame,
             reading += "这里只展示当前周期动量，不产生买卖信号。"
         if key == "month":
             reading += "末月若尚未结束，K线和Fr均为截至最新交易日的暂定值。"
+        if key == "month" or len(frames[key]) - len(frame) < 26:
+            how_fr.append(f"前26个{'月' if key == 'month' else ('交易日' if key == 'day' else '周')}为指标预热期，数值不可靠；图中不画这段Fr线和柱子。")
+        reference = '<div class="reference-view">参考视图：买卖信号只看周线</div>' if key != "week" else ''
+        k_reading = read_kline(summary, sig, frame, period=key)
+        if key != "week":
+            k_reading = "决策以周K为准：" + weekly_reading + "本视图补充：" + read_kline({}, {}, frame, period=key)
+        if key == "month" and frame[["open", "high", "low"]].isna().any(axis=1).any():
+            how_k.append("早期部分月份缺少开高低，仅以灰点显示月末收盘，不补造K线；均线和Fr仍使用真实收盘价。")
+        fr_title = name + " " + unit + "线Fr趋势动量（每根柱子是一" + unit + "）" + ("（仅供参考）" if key != "week" else "")
         panels.append(f'<div class="period-view period-{key}">'
                       f'<p class="muted small period-range">显示最近{count}{"个交易日" if key == "day" else unit}；'
                       f'实际 {len(frame)} 根，上下图共用时间轴。</p>'
-                      '<div class="figure">'
-                      f'<div class="chart">{kline_levels_chart(frame, name + " " + unit + "K与均线", price_levels(summary, sig), axis=axis, ma_periods=ma_periods)}</div>'
-                      f'{howto_block(unit + "K", how_k, read_kline(summary, sig, frame, period=key))}</div>'
-                      '<div class="figure">'
-                      f'<div class="chart">{svg_fr_chart(frame, name + " " + unit + "线Fr趋势动量（每根柱子是一" + unit + "）", height=330, axis=axis)}</div>'
+                      f'<div class="figure">{reference}'
+                      f'<div class="chart">{kline_levels_chart(frame, name + " " + unit + "K与均线", price_levels(summary, sig), axis=axis, ma_periods=ma_periods, events=events if key == "week" else None)}</div>'
+                      f'{howto_block(unit + "K", how_k, k_reading)}</div>'
+                      f'<div class="figure">{reference}'
+                      f'<div class="chart">{svg_fr_chart(fr_display_frame(frames[key], count), fr_title, height=330, axis=axis)}</div>'
                       f'{howto_block(unit + "线Fr", how_fr, reading)}</div></div>')
     return (f'<div class="period-charts" role="group" aria-label="{escape(name)}图表周期">'
             + ''.join(inputs) + '<div class="period-tabs">' + ''.join(labels) + '</div>'
@@ -1695,6 +1772,39 @@ def index_section(code: str, meta: Dict[str, str], summary: Dict[str, Any], pric
   </section>"""
 
 
+# Enhancement only: radio/CSS still selects views when JavaScript is unavailable.
+PERIOD_SCROLL_SCRIPT = """<script>
+(() => {
+  const narrow = window.matchMedia('(max-width: 819px)');
+  const groups = document.querySelectorAll('.period-charts');
+  const latest = group => {
+    if (!narrow.matches) return;
+    const active = group.querySelector('.period-toggle:checked');
+    const panel = group.querySelector('.period-' + active.value);
+    panel.querySelectorAll('.chart').forEach(chart => {
+      chart.scrollLeft = chart.scrollWidth - chart.clientWidth;
+    });
+  };
+  groups.forEach(group => {
+    group.querySelectorAll('.period-view').forEach(panel => {
+      const charts = [...panel.querySelectorAll('.chart')];
+      charts.forEach(chart => chart.addEventListener('scroll', () => {
+        if (!narrow.matches || !panel.getClientRects().length) return;
+        charts.forEach(other => {
+          if (other !== chart && Math.abs(other.scrollLeft - chart.scrollLeft) > 1)
+            other.scrollLeft = chart.scrollLeft;
+        });
+      }, {passive: true}));
+    });
+    group.addEventListener('change', () => requestAnimationFrame(() => latest(group)));
+    requestAnimationFrame(() => latest(group));
+  });
+  window.addEventListener('resize', () => requestAnimationFrame(() => groups.forEach(latest)));
+  window.addEventListener('pageshow', () => requestAnimationFrame(() => groups.forEach(latest)));
+})();
+</script>"""
+
+
 def render_html(
     summaries: Dict[str, Dict[str, Any]],
     prices: Dict[str, pd.DataFrame],
@@ -1757,6 +1867,7 @@ details.more{{margin-top:14px}} details.more summary{{cursor:pointer;color:#2563
  .todo li{{grid-template-columns:1fr;gap:2px}} .facts{{grid-template-columns:1fr 1fr}} .read{{grid-template-columns:1fr}} .read .now{{border-left:0;border-top:1px solid var(--line)}} .hero{{padding:22px}} .hero h1{{font-size:25px}} .chart{{overflow-x:auto}} .chart svg{{width:760px;max-width:none}} .section-heading{{align-items:flex-start;flex-direction:column}} .status{{text-align:left}}}}
 @media(max-width:480px){{.wrap{{padding:12px 10px 30px}} .hero,.panel{{border-radius:14px}} .panel{{padding:14px}} h2{{font-size:20px}} .decision .headline{{font-size:22px}}}}
 
+.reference-view{{background:#fef3c7;color:#92400e;border-bottom:1px solid #fcd34d;padding:8px 14px;font-weight:700;font-size:14px}}
 .period-charts{{position:relative;margin-top:18px}} .period-tabs{{display:inline-flex;border:1px solid #cbd5e1;border-radius:9px;overflow:hidden}} .period-tabs label{{padding:8px 22px;cursor:pointer;background:#f8fafc;color:#475569;font-weight:600}} .period-tabs label+label{{border-left:1px solid #cbd5e1}} .period-tabs label[aria-disabled="true"]{{color:#94a3b8;background:#f1f5f9;cursor:not-allowed}}
 .period-toggle{{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}} .period-view{{display:none}}
 .period-toggle[value="day"]:checked ~ .period-views .period-day{{display:block}}
@@ -1793,7 +1904,7 @@ details.more{{margin-top:14px}} details.more summary{{cursor:pointer;color:#2563
     </details>
   </section>
   <footer class="footer">本页是按预设规则生成的参考，不是投资建议。数据可能因供应方修订而变化。</footer>
-</main></body></html>"""
+</main>{PERIOD_SCROLL_SCRIPT}</body></html>"""
 
 
 def json_ready(value: Any) -> Any:
@@ -1842,11 +1953,19 @@ def run(
     monthly_prices: Dict[str, pd.DataFrame] = {}
     for code in INDEXES:
         signal_start = index_start_date(code, start)
-        # A single chunked fetch serves both views. Extra history is display-only:
-        # the original dates still feed signals, summaries and valuation rankings.
-        fetch_start = min(signal_start, MONTHLY_CHART_STARTS.get(code, signal_start))
+        # Keep the original CSI query boundaries for signals and valuation:
+        # CSI injects a boundary row, so extending those queries can shift samples.
+        fetch_start = (signal_start if code == "930955" else
+                       min(signal_start, MONTHLY_CHART_STARTS.get(code, signal_start)))
         full_price, full_valuation = fetch_csi_index_data(session, code, fetch_start, request_end)
         monthly_prices[code] = full_price
+        chart_start = MONTHLY_CHART_STARTS.get(code, fetch_start)
+        if chart_start < fetch_start:
+            earlier_end = (full_price["date"].min() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            earlier, _ = fetch_csi_index_data(session, code, chart_start, earlier_end,
+                                              include_close_only=True)
+            monthly_prices[code] = pd.concat([earlier, full_price], ignore_index=True).drop_duplicates(
+                "date", keep="last").sort_values("date").reset_index(drop=True)
         raw_prices[code] = full_price[full_price["date"] >= pd.Timestamp(signal_start)].copy()
         valuations[code] = full_valuation[full_valuation["date"] >= pd.Timestamp(signal_start)].copy()
         time.sleep(0.35)
