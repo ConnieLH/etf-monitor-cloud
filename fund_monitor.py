@@ -399,6 +399,31 @@ def build_date_tick_positions(plot_df: pd.DataFrame, max_ticks: int = 8) -> List
     return picks
 
 
+@dataclass(frozen=True)
+class ChartTimeAxis:
+    """One date sequence and plot geometry shared by an aligned chart pair."""
+
+    dates: Tuple[pd.Timestamp, ...]
+    xs: Tuple[float, ...]
+    ticks: Tuple[int, ...]
+    width: int
+    left: int
+    right: int
+
+
+def build_chart_time_axis(dates, width: int = 1060, left: int = 58,
+                          right: int = 118) -> ChartTimeAxis:
+    dates = tuple(pd.Timestamp(value) for value in dates)
+    frame = pd.DataFrame({"date": dates})
+    return ChartTimeAxis(dates, tuple(np.linspace(left, width - right, len(dates))),
+                         tuple(build_date_tick_positions(frame)), width, left, right)
+
+
+def validate_chart_time_axis(frame: pd.DataFrame, axis: ChartTimeAxis) -> None:
+    if tuple(pd.Timestamp(value) for value in frame["date"]) != axis.dates:
+        raise ValueError("Chart dates must exactly match the shared time axis")
+
+
 def svg_kline_chart(df: pd.DataFrame, title: str, mode: str = "index", width: int = 980, height: int = 360) -> str:
     plot_df = df.tail(220).reset_index(drop=True)
     if len(plot_df) < 20:
@@ -479,20 +504,25 @@ def svg_kline_chart(df: pd.DataFrame, title: str, mode: str = "index", width: in
     return "".join(parts)
 
 
-def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 320) -> str:
-    plot_df = df.dropna(subset=["fr", "fr_bar"]).tail(220).reset_index(drop=True)
+def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 320,
+                 *, axis: Optional[ChartTimeAxis] = None) -> str:
+    # Keep every supplied date in aligned mode, including an initial NaN BAR.
+    plot_df = (df if axis is not None else df.dropna(subset=["fr", "fr_bar"]).tail(220)).reset_index(drop=True)
+    if axis is not None:
+        validate_chart_time_axis(plot_df, axis)
+        width = axis.width
     if len(plot_df) < 20:
         return f"<div>图表 {title} 无足够数据</div>"
 
-    left_pad, right_pad, top_pad, bottom_pad = 58, 20, 30, 34
+    left_pad, right_pad, top_pad, bottom_pad = (axis.left if axis else 58), (axis.right if axis else 20), 30, 34
     chart_w = width - left_pad - right_pad
     chart_h = height - top_pad - bottom_pad
-    xs = np.linspace(left_pad, left_pad + chart_w, len(plot_df))
+    xs = axis.xs if axis else np.linspace(left_pad, left_pad + chart_w, len(plot_df))
 
     fr_vals = plot_df["fr"].astype(float).tolist()
     bar_vals = plot_df["fr_bar"].astype(float).tolist()
-    ymin = min(min(fr_vals), min(bar_vals), 0.0)
-    ymax = max(max(fr_vals), max(bar_vals), 0.0)
+    finite = [v for v in fr_vals + bar_vals if math.isfinite(v)] + [0.0]
+    ymin, ymax = min(finite), max(finite)
     if ymin == ymax:
         ymin -= 1.0
         ymax += 1.0
@@ -502,7 +532,7 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
 
     zero_y = scale_y(0.0)
     bar_w = max(chart_w / len(plot_df) * 0.72, 1.0)
-    fr_points = " ".join(f"{x:.1f},{scale_y(v):.1f}" for x, v in zip(xs, fr_vals))
+    fr_points = " ".join(f"{x:.1f},{scale_y(v):.1f}" for x, v in zip(xs, fr_vals) if math.isfinite(v))
 
     parts = [
         f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg">',
@@ -519,6 +549,8 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
     parts.append(f'<line x1="{left_pad}" y1="{zero_y:.1f}" x2="{left_pad + chart_w}" y2="{zero_y:.1f}" stroke="#9ca3af" stroke-width="1" stroke-dasharray="4 4"/>')
 
     for x, v in zip(xs, bar_vals):
+        if not math.isfinite(v):
+            continue
         y = scale_y(v)
         color = "#dc2626" if v >= 0 else "#16a34a"
         top = min(y, zero_y)
@@ -527,7 +559,7 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
 
     parts.append(f'<polyline fill="none" stroke="#2563eb" stroke-width="1.6" points="{fr_points}"/>')
 
-    label_idx = build_date_tick_positions(plot_df, max_ticks=8)
+    label_idx = axis.ticks if axis else build_date_tick_positions(plot_df, max_ticks=8)
     for i in label_idx:
         x = xs[i]
         label = plot_df.loc[i, "date"].strftime("%Y-%m") if i != len(plot_df) - 1 else plot_df.loc[i, "date"].strftime("%Y-%m-%d")
