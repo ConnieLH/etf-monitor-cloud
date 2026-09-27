@@ -22,7 +22,8 @@ import numpy as np
 import pandas as pd
 import requests
 
-from fund_monitor import compute_metrics, fmt_num, fmt_pct, summarize, svg_fr_chart, svg_kline_chart
+from fund_monitor import (ChartTimeAxis, build_chart_time_axis, validate_chart_time_axis,
+                          compute_metrics, fmt_num, fmt_pct, summarize, svg_fr_chart, svg_kline_chart)
 from signal_rules import signal_status, weekly_bars
 
 
@@ -1328,15 +1329,21 @@ def price_levels(summary: Dict[str, Any], sig: Dict[str, Any]) -> List[Tuple[flo
 
 
 def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, str, str]],
-                       width: int = 1060, height: int = 380) -> str:
-    """Daily candles + MA20/MA60 (same look as the original chart) with labelled price levels."""
+                       width: int = 1060, height: int = 380, *,
+                       axis: Optional[ChartTimeAxis] = None,
+                       ma_periods: Tuple[int, int] = (20, 60)) -> str:
+    """Candles and period moving averages with the shared pair's exact dates."""
 
-    plot = df.tail(220).reset_index(drop=True)
+    plot = (df if axis is not None else df.tail(250)).reset_index(drop=True)
+    if axis is not None:
+        validate_chart_time_axis(plot, axis)
+        width = axis.width
     if len(plot) < 20:
         return f"<div>图表 {escape(title)} 无足够数据</div>"
-    left, right, top, bottom = 58, 118, 34, 34
+    left, right, top, bottom = (axis.left if axis else 58), (axis.right if axis else 118), 34, 34
     cw, chh = width - left - right, height - top - bottom
-    xs = np.linspace(left, left + cw, len(plot))
+    axis = axis or build_chart_time_axis(plot["date"], width, left, right)
+    xs = axis.xs
     lo, hi = float(plot["low"].min()), float(plot["high"].max())
     for value, _, _ in levels:
         if lo * 0.8 <= value <= hi * 1.2:
@@ -1361,7 +1368,7 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         parts.append(f'<line x1="{x:.1f}" y1="{sy(h):.1f}" x2="{x:.1f}" y2="{sy(l):.1f}" stroke="{color}" stroke-width="1.1"/>')
         top_y = min(sy(o), sy(c))
         parts.append(f'<rect x="{x - body_w / 2:.2f}" y="{top_y:.2f}" width="{body_w:.2f}" height="{max(abs(sy(c) - sy(o)), 1.2):.2f}" fill="{color}" opacity="0.9"/>')
-    for col, color in [("ma_20", "#2563eb"), ("ma_60", "#f59e0b")]:
+    for col, color in [(f"ma_{ma_periods[0]}", "#2563eb"), (f"ma_{ma_periods[1]}", "#f59e0b")]:
         pts = [f"{x:.1f},{sy(float(v)):.1f}" for x, v in zip(xs, plot[col]) if pd.notna(v)]
         if pts:
             parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="1.7" points="{" ".join(pts)}"/>')
@@ -1378,12 +1385,12 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         parts.append(f'<text x="{left + cw + 6}" y="{ly:.1f}" font-size="11" fill="{color}">{escape(label)}</text>')
     last_x, last_close = xs[-1], float(plot["close"].iloc[-1])
     parts.append(f'<circle cx="{last_x:.1f}" cy="{sy(last_close):.1f}" r="3.5" fill="#111827"/>')
-    for i in build_date_tick_positions_local(plot):
+    for i in axis.ticks:
         label = plot.loc[i, "date"].strftime("%Y-%m") if i != len(plot) - 1 else plot.loc[i, "date"].strftime("%Y-%m-%d")
         parts.append(f'<text x="{xs[i]:.1f}" y="{height - 8}" font-size="11" fill="#6b7280" text-anchor="middle">{label}</text>')
     ly = 52
-    parts.append(f'<rect x="{left}" y="{ly}" width="12" height="3" fill="#2563eb"/><text x="{left + 18}" y="{ly + 4}" font-size="12" fill="#374151">MA20</text>')
-    parts.append(f'<rect x="{left + 70}" y="{ly}" width="12" height="3" fill="#f59e0b"/><text x="{left + 88}" y="{ly + 4}" font-size="12" fill="#374151">MA60</text>')
+    parts.append(f'<rect x="{left}" y="{ly}" width="12" height="3" fill="#2563eb"/><text x="{left + 18}" y="{ly + 4}" font-size="12" fill="#374151">MA{ma_periods[0]}</text>')
+    parts.append(f'<rect x="{left + 70}" y="{ly}" width="12" height="3" fill="#f59e0b"/><text x="{left + 88}" y="{ly + 4}" font-size="12" fill="#374151">MA{ma_periods[1]}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1401,21 +1408,113 @@ def build_date_tick_positions_local(plot: pd.DataFrame, max_ticks: int = 8) -> L
     return sorted(set(starts + [len(plot) - 1]))
 
 
+MONTHLY_CHART_STARTS = {"000510": "2010-01-01"}
+
+CHART_PERIODS = {
+    "day": ("日", 250, (20, 60)),
+    "week": ("周", 156, (20, 60)),
+    "month": ("月", 120, (12, 36)),
+}
+
+
+def aggregate_ohlc(daily: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Use actual last trading dates, including holiday-shortened W-SUN weeks."""
+    if period not in ("week", "month"):
+        raise ValueError("period must be week or month")
+    frame = daily[["date", "open", "high", "low", "close"]].copy()
+    frame = frame.dropna(subset=["date", "close"]).sort_values("date")
+    frame["period"] = frame["date"].dt.to_period("W-SUN" if period == "week" else "M")
+    return frame.groupby("period", sort=True).agg(
+        date=("date", "last"), open=("open", lambda values: values.iloc[0]),
+        high=("high", "max"), low=("low", "min"), close=("close", "last"),
+    ).reset_index(drop=True)
+
+
+def period_chart_frames(prices: pd.DataFrame,
+                        monthly_prices: Optional[pd.DataFrame] = None) -> Dict[str, pd.DataFrame]:
+    """Calculate on full history; only the rendering layer takes the last N bars."""
+    daily = prices.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    weekly = compute_metrics(aggregate_ohlc(daily, "week"))
+    signal_weekly = weekly_bars(daily)
+    if weekly["date"].tolist() != signal_weekly["date"].tolist():
+        raise ValueError("Weekly candles and signal dates differ")
+    weekly["fr"] = signal_weekly["fr"].to_numpy()
+    weekly["fr_bar"] = signal_weekly["bar"].to_numpy()
+    monthly = compute_metrics(aggregate_ohlc(
+        daily if monthly_prices is None else monthly_prices, "month"))
+    for n in (12, 36):
+        monthly[f"ma_{n}"] = monthly["close"].rolling(n).mean()
+    return {"day": compute_metrics(daily), "week": weekly, "month": monthly}
+
+
+def period_chart_pair(code: str, name: str, price: pd.DataFrame,
+                      summary: Dict[str, Any], sig: Dict[str, Any],
+                      monthly_prices: Optional[pd.DataFrame] = None) -> str:
+    frames = period_chart_frames(price, monthly_prices)
+    inputs, labels, panels = [], [], []
+    for key, (unit, count, ma_periods) in CHART_PERIODS.items():
+        disabled = key == "month" and len(frames[key]) < 48
+        radio_id = f"period-{code}-{key}"
+        inputs.append(f'<input class="period-toggle" type="radio" name="period-{code}" '
+                      f'id="{radio_id}" value="{key}"'
+                      + (' checked' if key == "week" else '')
+                      + (' disabled' if disabled else '') + '>')
+        labels.append(f'<label for="{radio_id}"'
+                      + (' aria-disabled="true" title="历史数据不足"' if disabled else '')
+                      + f'>{unit}K</label>')
+        if disabled:
+            continue
+        frame = frames[key].tail(count).reset_index(drop=True)
+        axis = build_chart_time_axis(frame["date"])
+        how_k = [f"每根蜡烛是一{unit}：红色收盘比开盘高，绿色收盘比开盘低。",
+                 f"蓝线是{ma_periods[0]}{unit}均线，橙线是{ma_periods[1]}{unit}均线，均线用完整历史计算。",
+                 HOWTO_KLINE[2], HOWTO_KLINE[3]]
+        if key == "week":
+            how_fr = HOWTO_WEEKLY
+            reading = read_weekly_fr(sig, frames[key])
+        else:
+            how_fr = [f"每根柱子代表一{unit}，与上面的{unit}K逐根对应。",
+                      "蓝线是Fr，红柱表示Fr上升，绿柱表示Fr下降，虚线为0轴。",
+                      "当前周期仅供观察；买卖信号始终使用已完成周线，不随视图切换。"]
+            last = frame.iloc[-1] if len(frame) else None
+            reading = (f"最新{unit}线Fr为 {last['fr']:+.4f}，BAR为 {last['fr_bar']:+.4f}。"
+                       if last is not None else "暂无数据。")
+            reading += "这里只展示当前周期动量，不产生买卖信号。"
+        if key == "month":
+            reading += "末月若尚未结束，K线和Fr均为截至最新交易日的暂定值。"
+        panels.append(f'<div class="period-view period-{key}">'
+                      f'<p class="muted small period-range">显示最近{count}{"个交易日" if key == "day" else unit}；'
+                      f'实际 {len(frame)} 根，上下图共用时间轴。</p>'
+                      '<div class="figure">'
+                      f'<div class="chart">{kline_levels_chart(frame, name + " " + unit + "K与均线", price_levels(summary, sig), axis=axis, ma_periods=ma_periods)}</div>'
+                      f'{howto_block(unit + "K", how_k, read_kline(summary, sig, frame, period=key))}</div>'
+                      '<div class="figure">'
+                      f'<div class="chart">{svg_fr_chart(frame, name + " " + unit + "线Fr趋势动量（每根柱子是一" + unit + "）", height=330, axis=axis)}</div>'
+                      f'{howto_block(unit + "线Fr", how_fr, reading)}</div></div>')
+    return (f'<div class="period-charts" role="group" aria-label="{escape(name)}图表周期">'
+            + ''.join(inputs) + '<div class="period-tabs">' + ''.join(labels) + '</div>'
+            + '<div class="period-views">' + ''.join(panels) + '</div></div>')
+
+
 def weekly_fr_frame(prices: pd.DataFrame) -> pd.DataFrame:
     weekly = weekly_bars(prices[["date", "close"]])
     return weekly.rename(columns={"bar": "fr_bar"})[["date", "fr", "fr_bar"]]
 
 
-def read_kline(summary: Dict[str, Any], sig: Dict[str, Any], price: pd.DataFrame) -> str:
+def read_kline(summary: Dict[str, Any], sig: Dict[str, Any], price: pd.DataFrame,
+               period: str = "day") -> str:
+    if price.empty:
+        return "暂无数据。"
+    unit, _, (fast, slow) = CHART_PERIODS[period]
     last = price.iloc[-1]
-    close, ma20, ma60 = float(last["close"]), last.get("ma_20"), last.get("ma_60")
+    close, ma20, ma60 = float(last["close"]), last.get(f"ma_{fast}"), last.get(f"ma_{slow}")
     if pd.notna(ma20) and pd.notna(ma60):
         if close < ma20 and close < ma60:
-            trend = f"收盘 {close:.0f} 在20日线（{ma20:.0f}）和60日线（{ma60:.0f}）下方，短期和中期都在走弱。"
+            trend = f"收盘 {close:.0f} 在{fast}{unit}线（{ma20:.0f}）和{slow}{unit}线（{ma60:.0f}）下方，短期和中期都在走弱。"
         elif close > ma20 and close > ma60:
-            trend = f"收盘 {close:.0f} 在20日线（{ma20:.0f}）和60日线（{ma60:.0f}）上方，短期和中期都在走强。"
+            trend = f"收盘 {close:.0f} 在{fast}{unit}线（{ma20:.0f}）和{slow}{unit}线（{ma60:.0f}）上方，短期和中期都在走强。"
         else:
-            trend = f"收盘 {close:.0f} 夹在20日线（{ma20:.0f}）和60日线（{ma60:.0f}）之间，处于震荡。"
+            trend = f"收盘 {close:.0f} 夹在{fast}{unit}线（{ma20:.0f}）和{slow}{unit}线（{ma60:.0f}）之间，处于震荡。"
     else:
         trend = f"收盘 {close:.0f}。"
     dd = summary.get("drawdown_250")
@@ -1566,8 +1665,8 @@ def progress_table(decisions: Dict[str, Dict[str, Any]], signals: Dict[str, Dict
 
 
 def index_section(code: str, meta: Dict[str, str], summary: Dict[str, Any], price: pd.DataFrame,
-                  valuation: pd.DataFrame, sig: Dict[str, Any], decision: Dict[str, Any], dividend: Dict[str, Any]) -> str:
-    weekly = weekly_fr_frame(price)
+                  valuation: pd.DataFrame, sig: Dict[str, Any], decision: Dict[str, Any], dividend: Dict[str, Any],
+                  monthly_prices: Optional[pd.DataFrame] = None) -> str:
     up = sig.get("regime") == "up" if sig else False
     pe_pct = summary.get("pe_percentile")
     pe_note = ""
@@ -1587,14 +1686,7 @@ def index_section(code: str, meta: Dict[str, str], summary: Dict[str, Any], pric
       <div><label>估值分位</label><b>{fmt_pct(pe_pct, 0)}</b><small>滚动PE {fmt_num(summary['pe_ttm'])}</small></div>
     </div>
     {pe_note}
-    <div class="figure">
-      <div class="chart">{kline_levels_chart(price, meta['name'] + ' 日K与均线', price_levels(summary, sig))}</div>
-      {howto_block('日K', HOWTO_KLINE, read_kline(summary, sig, price))}
-    </div>
-    <div class="figure">
-      <div class="chart">{svg_fr_chart(weekly, meta['name'] + ' 周线Fr趋势动量（每根柱子是一周）', width=1060, height=330)}</div>
-      {howto_block('周线Fr', HOWTO_WEEKLY, read_weekly_fr(sig, weekly))}
-    </div>
+    {period_chart_pair(code, meta["name"], price, summary, sig, monthly_prices)}
     <div class="figure">
       <div class="chart">{pe_chart(valuation, meta['name'], meta['color'])}</div>
       {howto_block('估值', HOWTO_PE, read_valuation(code, summary, dividend))}
@@ -1614,6 +1706,7 @@ def render_html(
     plans: Optional[Dict[str, Dict[str, Any]]] = None,
     dividend: Optional[Dict[str, Any]] = None,
     signals: Optional[Dict[str, Dict[str, Any]]] = None,
+    monthly_prices: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> str:
     dividend = dividend or {"available": False}
     if signals is None:
@@ -1627,7 +1720,7 @@ def render_html(
     else:
         valuation_notice = ""
     sections = "".join(
-        index_section(code, meta, summaries[code], prices[code], valuations[code], signals.get(code) or {}, decisions[code], dividend)
+        index_section(code, meta, summaries[code], prices[code], valuations[code], signals.get(code) or {}, decisions[code], dividend, (monthly_prices or {}).get(code))
         for code, meta in INDEXES.items()
     )
     crosscheck_text = ""
@@ -1663,6 +1756,18 @@ details.more{{margin-top:14px}} details.more summary{{cursor:pointer;color:#2563
 @media(max-width:820px){{.plan .section-heading{{flex-direction:column;align-items:flex-start}} .plan .status{{text-align:left}} .plan-table thead{{display:none}} .plan-table tr{{display:block;border-bottom:1px solid var(--line);padding:8px 0}} .plan-table td{{display:grid;grid-template-columns:92px 1fr;gap:10px;border:0;padding:5px 2px}} .plan-table td::before{{content:attr(data-label);color:var(--muted);font-size:12px;padding-top:2px}}
  .todo li{{grid-template-columns:1fr;gap:2px}} .facts{{grid-template-columns:1fr 1fr}} .read{{grid-template-columns:1fr}} .read .now{{border-left:0;border-top:1px solid var(--line)}} .hero{{padding:22px}} .hero h1{{font-size:25px}} .chart{{overflow-x:auto}} .chart svg{{width:760px;max-width:none}} .section-heading{{align-items:flex-start;flex-direction:column}} .status{{text-align:left}}}}
 @media(max-width:480px){{.wrap{{padding:12px 10px 30px}} .hero,.panel{{border-radius:14px}} .panel{{padding:14px}} h2{{font-size:20px}} .decision .headline{{font-size:22px}}}}
+
+.period-charts{{position:relative;margin-top:18px}} .period-tabs{{display:inline-flex;border:1px solid #cbd5e1;border-radius:9px;overflow:hidden}} .period-tabs label{{padding:8px 22px;cursor:pointer;background:#f8fafc;color:#475569;font-weight:600}} .period-tabs label+label{{border-left:1px solid #cbd5e1}} .period-tabs label[aria-disabled="true"]{{color:#94a3b8;background:#f1f5f9;cursor:not-allowed}}
+.period-toggle{{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}} .period-view{{display:none}}
+.period-toggle[value="day"]:checked ~ .period-views .period-day{{display:block}}
+.period-toggle[value="day"]:checked ~ .period-tabs label[for$="-day"]{{background:#2563eb;color:white}}
+.period-toggle[value="day"]:focus-visible ~ .period-tabs label[for$="-day"]{{outline:2px solid #111827;outline-offset:-3px}}
+.period-toggle[value="week"]:checked ~ .period-views .period-week{{display:block}}
+.period-toggle[value="week"]:checked ~ .period-tabs label[for$="-week"]{{background:#2563eb;color:white}}
+.period-toggle[value="week"]:focus-visible ~ .period-tabs label[for$="-week"]{{outline:2px solid #111827;outline-offset:-3px}}
+.period-toggle[value="month"]:checked ~ .period-views .period-month{{display:block}}
+.period-toggle[value="month"]:checked ~ .period-tabs label[for$="-month"]{{background:#2563eb;color:white}}
+.period-toggle[value="month"]:focus-visible ~ .period-tabs label[for$="-month"]{{outline:2px solid #111827;outline-offset:-3px}}
 </style>
 </head>
 <body><main class="wrap">
@@ -1734,13 +1839,16 @@ def run(
 
     raw_prices: Dict[str, pd.DataFrame] = {}
     valuations: Dict[str, pd.DataFrame] = {}
+    monthly_prices: Dict[str, pd.DataFrame] = {}
     for code in INDEXES:
-        raw_prices[code], valuations[code] = fetch_csi_index_data(
-            session,
-            code,
-            index_start_date(code, start),
-            request_end,
-        )
+        signal_start = index_start_date(code, start)
+        # A single chunked fetch serves both views. Extra history is display-only:
+        # the original dates still feed signals, summaries and valuation rankings.
+        fetch_start = min(signal_start, MONTHLY_CHART_STARTS.get(code, signal_start))
+        full_price, full_valuation = fetch_csi_index_data(session, code, fetch_start, request_end)
+        monthly_prices[code] = full_price
+        raw_prices[code] = full_price[full_price["date"] >= pd.Timestamp(signal_start)].copy()
+        valuations[code] = full_valuation[full_valuation["date"] >= pd.Timestamp(signal_start)].copy()
         time.sleep(0.35)
     shanghai = fetch_tencent_kline(session, "sh000001", start, request_end)
     shenzhen = fetch_tencent_kline(session, "sz399106", start, request_end)
@@ -1801,6 +1909,8 @@ def run(
         trimmed = frame[frame["date"] <= cutoff].copy().reset_index(drop=True)
         prices[code] = compute_metrics(trimmed)
         trimmed.to_csv(data_dir / f"{code}_price_daily.csv", index=False, encoding="utf-8-sig")
+        monthly_prices[code] = monthly_prices[code][monthly_prices[code]["date"] <= cutoff].copy()
+        monthly_prices[code].to_csv(data_dir / f"{code}_chart_price_daily.csv", index=False, encoding="utf-8-sig")
     for code, frame in valuations.items():
         valuations[code] = frame[frame["date"] <= cutoff].copy().reset_index(drop=True)
         if valuations[code].empty:
@@ -1853,6 +1963,7 @@ def run(
         plans=plans,
         dividend=dividend,
         signals=signals,
+        monthly_prices=monthly_prices,
     )
     (output_dir / "report.html").write_text(report, encoding="utf-8")
 
