@@ -536,7 +536,7 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
 
     parts = [
         f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg">',
-        f'<text x="20" y="24" font-size="16" font-weight="700" fill="#111827">{title}</text>',
+        f'<text class="chart-title" x="20" y="24" font-size="16" font-weight="700" fill="#111827">{title}</text>',
         f'<rect x="{left_pad}" y="{top_pad}" width="{chart_w}" height="{chart_h}" fill="#ffffff" stroke="#e5e7eb"/>',
     ]
 
@@ -544,7 +544,7 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
         y = top_pad + frac * chart_h
         val = ymax - frac * (ymax - ymin)
         parts.append(f'<line x1="{left_pad}" y1="{y:.1f}" x2="{left_pad + chart_w}" y2="{y:.1f}" stroke="#eef2f7" stroke-width="1"/>')
-        parts.append(f'<text x="6" y="{y+4:.1f}" font-size="11" fill="#6b7280">{val:.3f}</text>')
+        parts.append(f'<text class="axis-label" x="6" y="{y+4:.1f}" font-size="11" fill="#6b7280">{val:.3f}</text>')
 
     parts.append(f'<line x1="{left_pad}" y1="{zero_y:.1f}" x2="{left_pad + chart_w}" y2="{zero_y:.1f}" stroke="#9ca3af" stroke-width="1" stroke-dasharray="4 4"/>')
 
@@ -566,6 +566,7 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
         parts.append(f'<line x1="{x:.1f}" y1="{top_pad + chart_h}" x2="{x:.1f}" y2="{top_pad + chart_h + 4}" stroke="#9ca3af" stroke-width="1"/>')
         parts.append(f'<text x="{x:.1f}" y="{height-8}" font-size="11" fill="#6b7280" text-anchor="middle">{label}</text>')
 
+    parts.append('<g class="chart-legend">')
     ly = 52
     parts.append(f'<rect x="{left_pad}" y="{ly}" width="12" height="3" fill="#2563eb"/>')
     parts.append(f'<text x="{left_pad + 18}" y="{ly+4}" font-size="12" fill="#374151">Fr</text>')
@@ -573,7 +574,7 @@ def svg_fr_chart(df: pd.DataFrame, title: str, width: int = 980, height: int = 3
     parts.append(f'<text x="{left_pad + 88}" y="{ly+4}" font-size="12" fill="#374151">BAR增量</text>')
     parts.append(f'<rect x="{left_pad + 170}" y="{ly-4}" width="12" height="12" fill="#16a34a" opacity="0.75"/>')
     parts.append(f'<text x="{left_pad + 188}" y="{ly+4}" font-size="12" fill="#374151">BAR减量</text>')
-    parts.append("</svg>")
+    parts.append("</g></svg>")
     return "".join(parts)
 
 

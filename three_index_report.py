@@ -24,6 +24,8 @@ import requests
 
 from fund_monitor import (ChartTimeAxis, build_chart_time_axis, validate_chart_time_axis,
                           compute_metrics, fmt_num, fmt_pct, summarize, svg_fr_chart, svg_kline_chart)
+import xml.etree.ElementTree as ET
+
 from signal_rules import replay, signal_status, weekly_bars
 
 
@@ -1361,18 +1363,20 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
 
     body_w = max(cw / len(plot) * 0.58, 1.2)
     parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg">',
-             f'<text x="20" y="24" font-size="16" font-weight="700" fill="#111827">{escape(title)}</text>',
+             f'<text class="chart-title" x="20" y="24" font-size="16" font-weight="700" fill="#111827">{escape(title)}</text>',
              f'<rect x="{left}" y="{top}" width="{cw}" height="{chh}" fill="#ffffff" stroke="#e5e7eb"/>']
     for frac in [0, 0.25, 0.5, 0.75, 1]:
         y = top + frac * chh
         parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + cw}" y2="{y:.1f}" stroke="#eef2f7"/>')
-        parts.append(f'<text x="6" y="{y + 4:.1f}" font-size="11" fill="#6b7280">{hi - frac * (hi - lo):.0f}</text>')
+        parts.append(f'<text class="axis-label" x="6" y="{y + 4:.1f}" font-size="11" fill="#6b7280">{hi - frac * (hi - lo):.0f}</text>')
+    candle_boxes = []
     for x, (_, row) in zip(xs, plot.iterrows()):
         o, c, h, l = float(row["open"]), float(row["close"]), float(row["high"]), float(row["low"])
         if not all(math.isfinite(v) for v in (o, h, l)):
             # A close-only month is not an OHLC candle; never invent its range.
             parts.append(f'<circle class="close-only" cx="{x:.1f}" cy="{sy(c):.1f}" r="2.5" fill="#94a3b8"><title>仅有收盘价，开高低数据不完整</title></circle>')
             continue
+        candle_boxes.append((x - body_w / 2 - 2, sy(h) - 2, x + body_w / 2 + 2, sy(l) + 2))
         color = "#dc2626" if c >= o else "#16a34a"
         parts.append(f'<line x1="{x:.1f}" y1="{sy(h):.1f}" x2="{x:.1f}" y2="{sy(l):.1f}" stroke="{color}" stroke-width="1.1"/>')
         top_y = min(sy(o), sy(c))
@@ -1382,6 +1386,7 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         if pts:
             parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="1.7" points="{" ".join(pts)}"/>')
     label_ys: List[float] = []
+    level_boxes = []
     for value, label, color in sorted(levels, key=lambda item: -item[0]):
         if not lo <= value <= hi:
             continue
@@ -1390,10 +1395,10 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         while any(abs(ly - other) < 13 for other in label_ys):
             ly += 13
         label_ys.append(ly)
+        level_boxes.append((left + cw + 4, ly - 12, width, ly + 3))
         parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + cw}" y2="{y:.1f}" stroke="{color}" stroke-width="1.2" stroke-dasharray="6 4"/>')
         parts.append(f'<text x="{left + cw + 6}" y="{ly:.1f}" font-size="11" fill="{color}">{escape(label)}</text>')
-    # Labels are admitted only when their boxes do not touch a neighbouring
-    # marker or label. The triangle is always retained at its exact week.
+    # All obstacles share the SVG's coordinate system, including wick ranges.
     positions = {pd.Timestamp(d): i for i, d in enumerate(plot["date"])}
     markers = []
     for event in events or []:
@@ -1416,22 +1421,32 @@ def kline_levels_chart(df: pd.DataFrame, title: str, levels: List[Tuple[float, s
         parts.append(f'<g class="signal-marker" data-date="{event["date"]:%Y-%m-%d}" data-direction="{event["direction"]}" data-factor="{event["factor"]}">'
                      f'<title>{event["date"]:%Y-%m-%d} {escape(event["reason"])}；下一个交易日执行</title>'
                      f'<polygon points="{points}" fill="{color}"/>')
-        box = (x + 8, y - 8, x + 8 + 11 * len(label), y + 7)
-        occupied = [(mx - 7, my - 7, mx + 7, my + 7) for _, mx, my, _ in markers]
-        if box[2] <= left + cw and not any(overlaps(box, other) for other in occupied + labels_used):
-            parts.append(f'<text x="{x + 8:.1f}" y="{y + 4:.1f}" font-size="11" fill="{color}">{label}</text>')
+        half_width = (11 * len(label) + 4) / 2
+        occupied = candle_boxes + level_boxes + [(mx - 7, my - 7, mx + 7, my + 7) for _, mx, my, _ in markers]
+        for step in range(4):  # First placement, then at most three 12px moves.
+            center_y = y + (17 + 12 * step) * (1 if buy else -1)
+            box = (x - half_width, center_y - 9, x + half_width, center_y + 8)
+            if (box[0] < left or box[2] > width - 4 or box[1] < top or box[3] > height - bottom
+                    or any(overlaps(box, other) for other in occupied + labels_used)):
+                continue
+            if step:
+                parts.append(f'<line class="signal-leader" x1="{x:.1f}" x2="{x:.1f}" y1="{y + (5 if buy else -5):.1f}" y2="{box[1] if buy else box[3]:.1f}" stroke="{color}" stroke-width="0.7"/>')
+            bounds = ",".join(f"{v:.2f}" for v in box)
+            parts.append(f'<text class="signal-label" data-box="{bounds}" data-offset="{step * 12}" x="{x:.1f}" y="{center_y + 4:.1f}" text-anchor="middle" font-size="11" fill="{color}">{label}</text>')
             labels_used.append(box)
+            break
         parts.append('</g>')
     last_x, last_close = xs[-1], float(plot["close"].iloc[-1])
     parts.append(f'<circle cx="{last_x:.1f}" cy="{sy(last_close):.1f}" r="3.5" fill="#111827"/>')
     for i in axis.ticks:
         label = plot.loc[i, "date"].strftime("%Y-%m") if i != len(plot) - 1 else plot.loc[i, "date"].strftime("%Y-%m-%d")
         parts.append(f'<text x="{xs[i]:.1f}" y="{height - 8}" font-size="11" fill="#6b7280" text-anchor="middle">{label}</text>')
+    parts.append('<g class="chart-legend">')
     ly = 54
     parts.append(f'<rect class="ma-legend-bg" x="{left - 2}" y="{ly - 12}" width="148" height="23" rx="4" fill="#ffffff"/>')
     parts.append(f'<rect x="{left}" y="{ly}" width="12" height="3" fill="#2563eb"/><text x="{left + 18}" y="{ly + 4}" font-size="12" fill="#374151">MA{ma_periods[0]}</text>')
     parts.append(f'<rect x="{left + 70}" y="{ly}" width="12" height="3" fill="#f59e0b"/><text x="{left + 88}" y="{ly + 4}" font-size="12" fill="#374151">MA{ma_periods[1]}</text>')
-    parts.append("</svg>")
+    parts.append("</g></svg>")
     return "".join(parts)
 
 
@@ -1494,12 +1509,16 @@ def historical_signal_events(price: pd.DataFrame, sig: Dict[str, Any]) -> List[D
         return []
     weekly = weekly_bars(price)
     confirmed = weekly[weekly["date"] <= pd.Timestamp(sig["week_date"])].reset_index(drop=True)
-    events, previous = [], 1.0  # SignalState's initial factor; no invented buy.
-    for event in replay(confirmed).events:
+    replayed = replay(confirmed).events
+    if not replayed:
+        return []
+    # The first event establishes the initial state, never a historical trade.
+    events, previous = [], replayed[0]["factor"]
+    for event in replayed[1:]:
         factor = event["factor"]
         if factor != previous:
             buy = factor > previous
-            label = ("抄底半仓" if factor == 0.5 else "买") if buy else ("止损" if "止损" in event["reason"] else "卖")
+            label = ("抄底" if factor == 0.5 else "买") if buy else ("止损" if "止损" in event["reason"] else "卖")
             events.append(dict(event, direction="buy" if buy else "sell", label=label))
         previous = factor
     return events
@@ -1510,6 +1529,43 @@ def fr_display_frame(full: pd.DataFrame, count: int) -> pd.DataFrame:
     shown = full.copy()
     shown.loc[shown.index[:26], ["fr", "fr_bar"]] = np.nan
     return shown.tail(count).reset_index(drop=True)
+
+
+def period_chart_html(svg: str, title: str, legend: List[Tuple[str, str, str]],
+                      axis: ChartTimeAxis, height: int) -> str:
+    """Separate stationary HTML chrome and a sticky axis from the scrollable plot."""
+    if not svg.startswith("<svg"):
+        return svg
+    ns = "http://www.w3.org/2000/svg"
+    ET.register_namespace("", ns)
+    plot = ET.fromstring(svg)
+    y_axis = ET.Element(f"{{{ns}}}svg", {
+        "class": "chart-axis", "viewBox": f"0 16 {axis.left} {height - 16}",
+        "role": "img", "aria-label": "纵轴刻度",
+    })
+    ET.SubElement(y_axis, f"{{{ns}}}rect", {
+        "x": "0", "y": "16", "width": str(axis.left), "height": str(height - 16), "fill": "#fff",
+    })
+    for child in list(plot):
+        kind = child.get("class")
+        if kind in ("chart-title", "chart-legend", "axis-label"):
+            plot.remove(child)
+            if kind == "axis-label":
+                y_axis.append(child)
+    # A centred first tick would be clipped by the separate axis viewport.
+    for child in plot:
+        if child.get("text-anchor") == "middle" and child.get("x") == f"{axis.xs[0]:.1f}":
+            child.set("text-anchor", "start")
+    plot.set("class", "chart-plot")
+    plot.set("viewBox", f"{axis.left} 16 {axis.width - axis.left} {height - 16}")
+    plot.attrib.pop("height", None)
+    plot.attrib.pop("width", None)
+    items = ''.join(f'<span><i class="legend-{shape}" style="background:{color}"></i>{escape(label)}</span>'
+                    for label, color, shape in legend)
+    axis_ratio = axis.left / axis.width * 100
+    return (f'<header class="chart-heading"><h3>{escape(title)}</h3><div class="chart-legend">{items}</div></header>'
+            f'<div class="chart period-chart"><div class="chart-track" style="--axis-width:{axis_ratio:.8f}%">'
+            + ET.tostring(y_axis, encoding="unicode") + ET.tostring(plot, encoding="unicode") + '</div></div>')
 
 
 def period_chart_pair(code: str, name: str, price: pd.DataFrame,
@@ -1559,14 +1615,24 @@ def period_chart_pair(code: str, name: str, price: pd.DataFrame,
         if key == "month" and frame[["open", "high", "low"]].isna().any(axis=1).any():
             how_k.append("早期部分月份缺少开高低，仅以灰点显示月末收盘，不补造K线；均线和Fr仍使用真实收盘价。")
         fr_title = name + " " + unit + "线Fr趋势动量（每根柱子是一" + unit + "）" + ("（仅供参考）" if key != "week" else "")
+        k_title = name + " " + unit + "K与均线"
+        k_svg = kline_levels_chart(frame, k_title, price_levels(summary, sig), axis=axis,
+                                   ma_periods=ma_periods, events=events if key == "week" else None)
+        k_chart = period_chart_html(k_svg, k_title,
+                                    [(f"MA{ma_periods[0]}", "#2563eb", "line"),
+                                     (f"MA{ma_periods[1]}", "#f59e0b", "line")], axis, 380)
+        fr_svg = svg_fr_chart(fr_display_frame(frames[key], count), fr_title, height=330, axis=axis)
+        fr_chart = period_chart_html(fr_svg, fr_title,
+                                     [("Fr", "#2563eb", "line"), ("BAR增量", "#dc2626", "bar"),
+                                      ("BAR减量", "#16a34a", "bar")], axis, 330)
         panels.append(f'<div class="period-view period-{key}">'
                       f'<p class="muted small period-range">显示最近{count}{"个交易日" if key == "day" else unit}；'
                       f'实际 {len(frame)} 根，上下图共用时间轴。</p>'
                       f'<div class="figure">{reference}'
-                      f'<div class="chart">{kline_levels_chart(frame, name + " " + unit + "K与均线", price_levels(summary, sig), axis=axis, ma_periods=ma_periods, events=events if key == "week" else None)}</div>'
+                      f'{k_chart}'
                       f'{howto_block(unit + "K", how_k, k_reading)}</div>'
                       f'<div class="figure">{reference}'
-                      f'<div class="chart">{svg_fr_chart(fr_display_frame(frames[key], count), fr_title, height=330, axis=axis)}</div>'
+                      f'{fr_chart}'
                       f'{howto_block(unit + "线Fr", how_fr, reading)}</div></div>')
     return (f'<div class="period-charts" role="group" aria-label="{escape(name)}图表周期">'
             + ''.join(inputs) + '<div class="period-tabs">' + ''.join(labels) + '</div>'
@@ -1867,6 +1933,12 @@ details.more{{margin-top:14px}} details.more summary{{cursor:pointer;color:#2563
  .todo li{{grid-template-columns:1fr;gap:2px}} .facts{{grid-template-columns:1fr 1fr}} .read{{grid-template-columns:1fr}} .read .now{{border-left:0;border-top:1px solid var(--line)}} .hero{{padding:22px}} .hero h1{{font-size:25px}} .chart{{overflow-x:auto}} .chart svg{{width:760px;max-width:none}} .section-heading{{align-items:flex-start;flex-direction:column}} .status{{text-align:left}}}}
 @media(max-width:480px){{.wrap{{padding:12px 10px 30px}} .hero,.panel{{border-radius:14px}} .panel{{padding:14px}} h2{{font-size:20px}} .decision .headline{{font-size:22px}}}}
 
+.chart-heading{{padding:10px 16px 2px;background:#fff}} .chart-heading h3{{margin:0;font-size:16px;line-height:1.5}} .chart-heading .chart-legend{{display:flex;flex-wrap:wrap;gap:6px 20px;margin-top:5px;color:#374151;font-size:12px}} .chart-legend span{{display:inline-flex;align-items:center;gap:6px}} .chart-legend i{{display:inline-block;width:12px}} .legend-line{{height:3px}} .legend-bar{{height:12px;opacity:.75}}
+.period-chart .chart-track{{display:flex;width:100%;min-width:640px;position:relative;isolation:isolate;align-items:flex-start}}
+.period-chart .chart-axis{{flex:0 0 var(--axis-width);width:var(--axis-width);position:sticky;left:0;z-index:2;background:#fff}}
+.period-chart .chart-plot{{flex:0 0 calc(100% - var(--axis-width));width:calc(100% - var(--axis-width))}}
+.period-chart svg{{min-width:0;height:auto;max-width:none}}
+@media(max-width:819px){{.period-chart{{padding:8px 0}} .period-chart .chart-track{{width:760px}} .period-chart .chart-axis text{{font-size:15px}}}}
 .reference-view{{background:#fef3c7;color:#92400e;border-bottom:1px solid #fcd34d;padding:8px 14px;font-weight:700;font-size:14px}}
 .period-charts{{position:relative;margin-top:18px}} .period-tabs{{display:inline-flex;border:1px solid #cbd5e1;border-radius:9px;overflow:hidden}} .period-tabs label{{padding:8px 22px;cursor:pointer;background:#f8fafc;color:#475569;font-weight:600}} .period-tabs label+label{{border-left:1px solid #cbd5e1}} .period-tabs label[aria-disabled="true"]{{color:#94a3b8;background:#f1f5f9;cursor:not-allowed}}
 .period-toggle{{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}} .period-view{{display:none}}

@@ -260,7 +260,7 @@ class ReportIntegrationTests(unittest.TestCase):
             self.assertTrue(all(sig["regime"] in ("up", "down") for sig in snapshot["weekly_signals"].values()))
             self.assertIn("统一数据截止：2026-08-26（价格、趋势与成交）", html)
             self.assertIn("不会再把K线、均线、Fr或成交额裁回旧日", html)
-            self.assertEqual(html.count(" 日K与均线</text>"), 3)
+            self.assertEqual(html.count(" 日K与均线</h3>"), 3)
             self.assertEqual(html.count("周线Fr趋势动量（每根柱子是一周）"), 3)
             self.assertEqual(html.count("怎么看这张图"), 15)
             self.assertEqual(html.count('value="week" checked'), 3)
