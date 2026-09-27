@@ -27,8 +27,9 @@ class FollowupTests(unittest.TestCase):
         self.assertFalse(sig['week_complete'])
         weekly = weekly_bars(daily)
         confirmed = weekly.iloc[:-1].reset_index(drop=True)
-        expected, previous = [], 1.0
-        for event in replay(confirmed).events:
+        replayed = replay(confirmed).events
+        expected, previous = [], replayed[0]["factor"]
+        for event in replayed[1:]:
             if event['factor'] != previous:
                 expected.append((event['date'], 'buy' if event['factor'] > previous else 'sell', event['factor']))
             previous = event['factor']
@@ -101,7 +102,7 @@ class FollowupTests(unittest.TestCase):
 
     def test_nearby_marker_labels_are_omitted_but_triangles_remain(self):
         frame = period_chart_frames(history())['week'].tail(156).reset_index(drop=True)
-        events = [dict(date=d, direction='buy', factor=.5, label='抄底半仓', reason='测试') for d in frame.date.iloc[70:80]]
+        events = [dict(date=d, direction='buy', factor=.5, label='抄底', reason='测试') for d in frame.date.iloc[70:80]]
         svg = ET.fromstring(kline_levels_chart(frame, 'K', [], axis=build_chart_time_axis(frame.date), events=events))
         groups = svg.findall('s:g[@class="signal-marker"]', NS)
         self.assertEqual(len(groups), 10)
