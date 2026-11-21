@@ -35,6 +35,14 @@ class WeekCompleteTests(unittest.TestCase):
         self.assertTrue(week_is_complete(pd.Timestamp("2026-08-28"), None))
         self.assertFalse(week_is_complete(pd.Timestamp("2026-08-26"), None))
 
+    def test_stale_cross_year_calendar_falls_back_to_weekday_check(self):
+        calendar = pd.DatetimeIndex(["2026-12-29", "2026-12-30", "2026-12-31"])
+        # Calendar ends on 2026-12-31: Monday 2027-01-04 must NOT be treated as a completed week.
+        self.assertFalse(week_is_complete(pd.Timestamp("2027-01-04"), calendar))
+        self.assertTrue(week_is_complete(pd.Timestamp("2027-01-08"), calendar))
+        # Year-end Thursday 2026-12-31 is still covered by the calendar and confirmed complete.
+        self.assertTrue(week_is_complete(pd.Timestamp("2026-12-31"), calendar))
+
 
 class RegimeTests(unittest.TestCase):
     def test_exit_on_first_week_below_zero_and_reentry_above(self):

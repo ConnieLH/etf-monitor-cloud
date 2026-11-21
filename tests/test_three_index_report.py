@@ -12,6 +12,7 @@ from three_index_report import (
     INDEXES,
     MIN_SPREAD_HISTORY_FOR_PERCENTILE,
     PE_PERCENTILE_RULES,
+    PERIOD_SCROLL_SCRIPT,
     cutoff_for_completed_day,
     dividend_status,
     drawdown_trigger,
@@ -21,11 +22,15 @@ from three_index_report import (
     index_start_date,
     investment_plan,
     latest_frame_date,
+    latest_trade_calendar_day,
     merge_dividend_history,
     normalize_shanghai_now,
+    read_history,
     resolve_data_freshness,
     run,
+    svg_multi_line,
     upsert_rows,
+    write_history,
 )
 
 
@@ -452,6 +457,77 @@ class HistoryTests(unittest.TestCase):
 
         stale = dividend_status(history, pd.Timestamp("2026-10-01"))
         self.assertFalse(stale["available"])
+
+    def test_merge_dividend_history_filters_non_trading_holidays(self):
+        trade_dates = pd.DatetimeIndex(["2026-09-30", "2026-10-08", "2026-10-09"])
+        existing = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-09-30", "2026-10-01"]),
+                "code": ["930955", "930955"],
+                "dividend_yield": [5.01, 5.01],
+                "cn10y": [1.68, 1.68],
+                "spread": [3.33, 3.33],
+            }
+        )
+        dividend = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-10-02", "2026-10-08", "2026-10-12"]),
+                "dividend_yield": [5.01, 4.97, 4.89],
+            }
+        )
+        bond = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-09-30", "2026-10-08"]), "cn10y": [1.68, 1.69]}
+        )
+        merged = merge_dividend_history(existing, dividend, bond, "930955", trade_dates=trade_dates)
+        # 2026-10-01 and 2026-10-02 are dropped as holidays; 2026-10-12 (weekday past calendar max) is kept.
+        self.assertEqual(
+            merged["date"].dt.strftime("%Y-%m-%d").tolist(),
+            ["2026-09-30", "2026-10-08", "2026-10-12"],
+        )
+
+    def test_write_history_float_round_trip_is_stable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "history.csv"
+            frame = pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-11-11"]),
+                    "code": ["930955"],
+                    "spread": [4.92 - 1.6039],
+                    "pe_percentile": [1 / 3],
+                }
+            )
+            write_history(path, frame, ["date", "code"])
+            first = path.read_text(encoding="utf-8")
+            write_history(path, read_history(path), ["date", "code"])
+            second = path.read_text(encoding="utf-8")
+            self.assertEqual(first, second)
+            self.assertIn("3.3161", first)
+
+    def test_trade_calendar_retries_transient_failure(self):
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise ConnectionError("temporary network blip")
+            return pd.DataFrame({"trade_date": ["2026-11-19", "2026-11-20"]})
+
+        with patch("akshare.tool_trade_date_hist_sina", side_effect=flaky), patch(
+            "three_index_report.time.sleep"
+        ):
+            latest, status = latest_trade_calendar_day(pd.Timestamp("2026-11-20"), attempts=3)
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(latest, pd.Timestamp("2026-11-20"))
+        self.assertEqual(status["status"], "ok")
+
+    def test_pe_chart_scroll_script_and_right_margin_prevent_clipping(self):
+        self.assertIn(".index-section > .figure > .chart", PERIOD_SCROLL_SCRIPT)
+        dates = pd.Series(pd.bdate_range("2026-01-01", periods=20))
+        values = pd.Series([10.0 + i * 0.1 for i in range(20)])
+        svg = svg_multi_line([("滚动市盈率", values, "#2563eb")], dates, "测试PE图")
+        # Plot width = 1060 - left(66) - right(36) = 958, leaving 36px on the right for the last date label.
+        self.assertIn('width="958"', svg)
 
 
 if __name__ == "__main__":

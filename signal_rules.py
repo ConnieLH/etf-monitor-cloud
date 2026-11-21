@@ -51,8 +51,13 @@ def week_is_complete(last_date: pd.Timestamp, trade_dates: Optional[pd.DatetimeI
     last_date = pd.Timestamp(last_date).normalize()
     week_end = last_date + pd.Timedelta(days=6 - last_date.weekday())
     if trade_dates is not None and len(trade_dates):
-        later = trade_dates[(trade_dates > last_date) & (trade_dates <= week_end)]
-        return len(later) == 0
+        calendar = pd.DatetimeIndex(trade_dates).normalize()
+        # Only trust the calendar when it covers last_date; otherwise (e.g. cross-year
+        # lag before the new year's calendar is published) fall back to weekday check
+        # so an incomplete Monday–Thursday bar is never misclassified as confirmed.
+        if calendar.max() >= last_date:
+            later = calendar[(calendar > last_date) & (calendar <= week_end)]
+            return len(later) == 0
     return last_date.weekday() >= 4
 
 

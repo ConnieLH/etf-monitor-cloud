@@ -2,16 +2,18 @@ name: daily-report
 
 on:
   schedule:
-    # 避开整点拥堵并重试：北京时间 17:07、17:27、18:07、19:47
-    - cron: '7,27 9 * * 1-5'
-    - cron: '7 10 * * 1-5'
-    - cron: '47 11 * * 1-5'
+    # 避开整点拥堵并拉大间隔：北京时间 17:13、18:19、19:43，以及次日开盘前 07:23 兜底（非高峰段）
+    - cron: '13 9 * * 1-5'
+    - cron: '19 10 * * 1-5'
+    - cron: '43 11 * * 1-5'
+    - cron: '23 23 * * 1-5'
   workflow_dispatch: {}
 
 permissions:
   # contents: write 用于把 history/ 的每日数据提交回仓库。
   # 这些提交同时算作仓库活动，避免公开仓库 60 天无活动后定时任务被 GitHub 自动停用。
   contents: write
+  issues: write
   pages: write
   id-token: write
 
@@ -97,3 +99,56 @@ jobs:
           git commit -m "data: ${DATA_DATE} 每日快照"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      # 仅在当晚最后一次重试、次日开盘前兜底或手动运行失败时发送 Issue 告警，避免偶发波动刷屏。
+      - name: Notify failure via Issue
+        if: failure() && (github.event_name == 'workflow_dispatch' || github.event.schedule == '43 11 * * 1-5' || github.event.schedule == '23 23 * * 1-5')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_DESC: ${{ github.event_name }} (${{ github.event.schedule || 'manual' }})
+        run: |
+          TITLE="[告警] 每日报告生成失败"
+          BODY=$(python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          lines = [
+              "每日 ETF 监控报告任务失败，请检查数据源或手动补跑：",
+              f"- 触发方式：{os.environ['EVENT_DESC']}",
+              f"- 运行记录：{os.environ['RUN_URL']}",
+          ]
+          freshness_file = Path("output/source_freshness.json")
+          if freshness_file.exists():
+              data = json.loads(freshness_file.read_text(encoding="utf-8"))
+              lines.append(f"- 期望交易日：{data.get('expected_trading_day')}")
+              lines.append(f"- 交易日历状态：{data.get('trade_calendar')}")
+              lines.append(f"- 滞后数据源：{data.get('stale_required_sources')}")
+              if data.get("freshness_error"):
+                  lines.append(f"- 错误详情：{data['freshness_error']}")
+          else:
+              lines.append("- 未生成 `source_freshness.json`（抓数阶段可能出现网络异常或超时）。")
+          print("\n".join(lines))
+          PY
+          )
+          EXISTING=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -n 1)
+          if [ -n "${EXISTING}" ]; then
+            gh issue comment "${EXISTING}" --repo "${GITHUB_REPOSITORY}" --body "${BODY}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${TITLE}" --body "${BODY}"
+          fi
+
+      - name: Auto-close failure alert on recovery
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="[告警] 每日报告生成失败"
+          EXISTING=$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -n 1)
+          if [ -n "${EXISTING}" ]; then
+            DATA_DATE=$(python -c "import json;print(json.load(open('output/data_snapshot.json'))['data_cutoff'])")
+            gh issue close "${EXISTING}" --repo "${GITHUB_REPOSITORY}" --comment "每日报告已恢复正常（最新数据截止：${DATA_DATE}；运行记录：${RUN_URL}）。"
+          fi

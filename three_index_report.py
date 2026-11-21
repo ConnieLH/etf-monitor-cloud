@@ -128,7 +128,7 @@ def get_with_retry(
     *,
     params: Dict[str, str],
     timeout: int = 30,
-    attempts: int = 3,
+    attempts: int = 5,
 ) -> requests.Response:
     last_error: Optional[Exception] = None
     for attempt in range(attempts):
@@ -139,7 +139,7 @@ def get_with_retry(
         except Exception as error:  # pragma: no cover - exercised by live failures
             last_error = error
             if attempt + 1 < attempts:
-                time.sleep(1.2 * (attempt + 1))
+                time.sleep(min(1.5 * (2 ** attempt), 10.0))
     raise RuntimeError(f"数据请求失败：{url}；{last_error}")
 
 
@@ -385,7 +385,11 @@ def latest_frame_date(
 TRADE_DATES: Optional[pd.DatetimeIndex] = None   # full calendar, used to tell whether a week is complete
 
 
-def latest_trade_calendar_day(calendar_cap: pd.Timestamp) -> Tuple[Optional[pd.Timestamp], Dict[str, Any]]:
+def latest_trade_calendar_day(
+    calendar_cap: pd.Timestamp,
+    *,
+    attempts: int = 3,
+) -> Tuple[Optional[pd.Timestamp], Dict[str, Any]]:
     """Read the A-share trade calendar; callers fail closed if it is unavailable."""
 
     global TRADE_DATES
@@ -394,24 +398,29 @@ def latest_trade_calendar_day(calendar_cap: pd.Timestamp) -> Tuple[Optional[pd.T
         "status": "degraded",
         "source": "akshare.tool_trade_date_hist_sina",
     }
-    try:
-        import akshare as ak
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            import akshare as ak
 
-        calendar = ak.tool_trade_date_hist_sina()
-        if calendar.empty:
-            raise RuntimeError("交易日历为空")
-        column = "trade_date" if "trade_date" in calendar else calendar.columns[0]
-        dates = pd.to_datetime(calendar[column], errors="coerce").dropna()
-        TRADE_DATES = pd.DatetimeIndex(dates).normalize()
-        dates = dates[dates <= calendar_cap]
-        if dates.empty:
-            raise RuntimeError(f"交易日历没有不晚于 {calendar_cap:%Y-%m-%d} 的日期")
-        latest = pd.Timestamp(dates.max()).normalize()
-        status.update({"status": "ok", "latest_date": latest})
-        return latest, status
-    except Exception as error:  # pragma: no cover - depends on live calendar service
-        status["error"] = str(error)
-        return None, status
+            calendar = ak.tool_trade_date_hist_sina()
+            if calendar.empty:
+                raise RuntimeError("交易日历为空")
+            column = "trade_date" if "trade_date" in calendar else calendar.columns[0]
+            dates = pd.to_datetime(calendar[column], errors="coerce").dropna()
+            TRADE_DATES = pd.DatetimeIndex(dates).normalize()
+            dates = dates[dates <= calendar_cap]
+            if dates.empty:
+                raise RuntimeError(f"交易日历没有不晚于 {calendar_cap:%Y-%m-%d} 的日期")
+            latest = pd.Timestamp(dates.max()).normalize()
+            status.update({"status": "ok", "latest_date": latest})
+            return latest, status
+        except Exception as error:  # pragma: no cover - depends on live calendar service
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(2.0 * (attempt + 1))
+    status["error"] = str(last_error)
+    return None, status
 
 
 def resolve_data_freshness(
@@ -568,7 +577,7 @@ def svg_multi_line(
     baseline: Optional[float] = None,
     value_suffix: str = "",
 ) -> str:
-    left, right, top, bottom = 66, 24, 54, 42
+    left, right, top, bottom = 66, 36, 54, 42
     chart_w, chart_h = width - left - right, height - top - bottom
     all_values: List[float] = []
     for _, values, _ in series:
@@ -684,7 +693,7 @@ def build_turnover(shanghai: pd.DataFrame, shenzhen: pd.DataFrame) -> pd.DataFra
 
 def turnover_chart(frame: pd.DataFrame, width: int = 1060, height: int = 380) -> str:
     plot = frame.tail(252).reset_index(drop=True)
-    left, right, top, bottom = 66, 24, 54, 42
+    left, right, top, bottom = 66, 36, 54, 42
     chart_w, chart_h = width - left - right, height - top - bottom
     values = plot["total_amount"] / 1e12
     ma20 = plot["ma20"] / 1e12
@@ -775,7 +784,7 @@ DAILY_HISTORY_FILE = "daily_snapshots.csv"
 DIVIDEND_MAX_STALE_DAYS = 14
 
 
-def fetch_csi_dividend_yield(code: str) -> pd.DataFrame:
+def fetch_csi_dividend_yield(code: str, *, attempts: int = 3) -> pd.DataFrame:
     """中证官方指数估值（近一段时间），取股息率。
 
     该接口只返回最近一段数据，所以需要每天把结果存进 history/ 逐步积累历史。
@@ -784,9 +793,20 @@ def fetch_csi_dividend_yield(code: str) -> pd.DataFrame:
 
     import akshare as ak
 
-    raw = ak.stock_zh_index_value_csindex(symbol=code)
+    raw: Optional[pd.DataFrame] = None
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            raw = ak.stock_zh_index_value_csindex(symbol=code)
+            if raw is not None and not raw.empty:
+                break
+        except Exception as error:  # pragma: no cover - depends on live services
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(1.5 * (attempt + 1))
     if raw is None or raw.empty:
-        raise RuntimeError(f"中证指数估值接口未返回 {code} 的数据")
+        suffix = f"：{last_error}" if last_error is not None else ""
+        raise RuntimeError(f"中证指数估值接口未返回 {code} 的数据{suffix}")
     column = next((name for name in ["股息率2", "股息率1"] if name in raw.columns), None)
     if column is None or "日期" not in raw.columns:
         raise RuntimeError(f"中证指数估值接口 {code} 缺少日期或股息率字段")
@@ -800,15 +820,26 @@ def fetch_csi_dividend_yield(code: str) -> pd.DataFrame:
     return frame.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
-def fetch_cn10y_yield(start: pd.Timestamp) -> pd.DataFrame:
+def fetch_cn10y_yield(start: pd.Timestamp, *, attempts: int = 3) -> pd.DataFrame:
     """中国10年期国债收益率（%），来自 AKShare 的中美国债收益率接口。"""
 
     import akshare as ak
 
-    raw = ak.bond_zh_us_rate(start_date=pd.Timestamp(start).strftime("%Y%m%d"))
+    raw: Optional[pd.DataFrame] = None
+    last_error: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            raw = ak.bond_zh_us_rate(start_date=pd.Timestamp(start).strftime("%Y%m%d"))
+            if raw is not None and not raw.empty:
+                break
+        except Exception as error:  # pragma: no cover - depends on live services
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(1.5 * (attempt + 1))
     column = "中国国债收益率10年"
     if raw is None or raw.empty or column not in raw.columns or "日期" not in raw.columns:
-        raise RuntimeError("国债收益率接口未返回中国10年期数据")
+        suffix = f"：{last_error}" if last_error is not None else ""
+        raise RuntimeError(f"国债收益率接口未返回中国10年期数据{suffix}")
     frame = pd.DataFrame(
         {
             "date": pd.to_datetime(raw["日期"], errors="coerce"),
@@ -833,6 +864,8 @@ def write_history(path: Optional[Path], frame: pd.DataFrame, keys: List[str]) ->
     path.parent.mkdir(parents=True, exist_ok=True)
     output = frame.copy()
     output["date"] = pd.to_datetime(output["date"]).dt.strftime("%Y-%m-%d")
+    for column in output.select_dtypes(include=["float", "floating"]).columns:
+        output[column] = output[column].round(8)
     output = output.sort_values(keys).reset_index(drop=True)
     output.to_csv(path, index=False, encoding="utf-8")
 
@@ -856,18 +889,37 @@ def upsert_rows(existing: pd.DataFrame, new_rows: pd.DataFrame, keys: List[str])
     return combined.sort_values(keys).reset_index(drop=True)
 
 
+def filter_trading_dates(
+    frame: pd.DataFrame,
+    trade_dates: Optional[pd.DatetimeIndex],
+) -> pd.DataFrame:
+    """Drop non-trading holiday rows covered by *trade_dates*; keep weekdays past calendar max."""
+
+    if frame.empty or "date" not in frame or trade_dates is None or not len(trade_dates):
+        return frame
+    calendar = pd.DatetimeIndex(trade_dates).normalize()
+    cal_min, cal_max = calendar.min(), calendar.max()
+    dates = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    in_range = (dates >= cal_min) & (dates <= cal_max)
+    keep = (~in_range & (dates.dt.weekday < 5)) | (in_range & dates.isin(calendar))
+    return frame[keep].reset_index(drop=True)
+
+
 def merge_dividend_history(
     existing: pd.DataFrame,
     dividend: pd.DataFrame,
     bond: pd.DataFrame,
     code: str,
+    trade_dates: Optional[pd.DatetimeIndex] = None,
 ) -> pd.DataFrame:
     """Attach the latest 10Y yield on or before each dividend date, then upsert."""
 
-    if dividend.empty or bond.empty:
-        return existing
+    cleaned_existing = filter_trading_dates(existing, trade_dates)
+    filtered_dividend = filter_trading_dates(dividend, trade_dates)
+    if filtered_dividend.empty or bond.empty:
+        return cleaned_existing
     merged = pd.merge_asof(
-        dividend.sort_values("date"),
+        filtered_dividend.sort_values("date"),
         bond.sort_values("date"),
         on="date",
         direction="backward",
@@ -875,7 +927,7 @@ def merge_dividend_history(
     merged["code"] = code
     merged["spread"] = merged["dividend_yield"] - merged["cn10y"]
     merged = merged[["date", "code", "dividend_yield", "cn10y", "spread"]]
-    return upsert_rows(existing, merged, ["date", "code"])
+    return upsert_rows(cleaned_existing, merged, ["date", "code"])
 
 
 def dividend_status(history: pd.DataFrame, cutoff: pd.Timestamp, code: str = DIVIDEND_CODE) -> Dict[str, Any]:
@@ -913,7 +965,11 @@ def dividend_status(history: pd.DataFrame, cutoff: pd.Timestamp, code: str = DIV
     return status
 
 
-def update_dividend_history(history_dir: Optional[Path], cutoff: pd.Timestamp) -> Dict[str, Any]:
+def update_dividend_history(
+    history_dir: Optional[Path],
+    cutoff: pd.Timestamp,
+    trade_dates: Optional[pd.DatetimeIndex] = None,
+) -> Dict[str, Any]:
     """Fetch today's dividend yield and 10Y yield, store them, and report status.
 
     Non-blocking: any failure is recorded and the plan falls back to PE percentile.
@@ -921,11 +977,12 @@ def update_dividend_history(history_dir: Optional[Path], cutoff: pd.Timestamp) -
 
     path = history_dir / DIVIDEND_HISTORY_FILE if history_dir is not None else None
     history = read_history(path)
+    effective_trade_dates = TRADE_DATES if trade_dates is None else trade_dates
     fetch_error: Optional[str] = None
     try:
         dividend = fetch_csi_dividend_yield(DIVIDEND_CODE)
         bond = fetch_cn10y_yield(pd.Timestamp(cutoff) - pd.Timedelta(days=400))
-        history = merge_dividend_history(history, dividend, bond, DIVIDEND_CODE)
+        history = merge_dividend_history(history, dividend, bond, DIVIDEND_CODE, trade_dates=effective_trade_dates)
         write_history(path, history, ["date", "code"])
     except Exception as error:  # pragma: no cover - depends on live services
         fetch_error = str(error)
@@ -1843,13 +1900,19 @@ PERIOD_SCROLL_SCRIPT = """<script>
 (() => {
   const narrow = window.matchMedia('(max-width: 819px)');
   const groups = document.querySelectorAll('.period-charts');
+  const standaloneCharts = document.querySelectorAll('.index-section > .figure > .chart');
+  const scrollToLatest = chart => {
+    chart.scrollLeft = chart.scrollWidth - chart.clientWidth;
+  };
   const latest = group => {
     if (!narrow.matches) return;
     const active = group.querySelector('.period-toggle:checked');
     const panel = group.querySelector('.period-' + active.value);
-    panel.querySelectorAll('.chart').forEach(chart => {
-      chart.scrollLeft = chart.scrollWidth - chart.clientWidth;
-    });
+    panel.querySelectorAll('.chart').forEach(scrollToLatest);
+  };
+  const latestAll = () => {
+    groups.forEach(latest);
+    if (narrow.matches) standaloneCharts.forEach(scrollToLatest);
   };
   groups.forEach(group => {
     group.querySelectorAll('.period-view').forEach(panel => {
@@ -1863,10 +1926,10 @@ PERIOD_SCROLL_SCRIPT = """<script>
       }, {passive: true}));
     });
     group.addEventListener('change', () => requestAnimationFrame(() => latest(group)));
-    requestAnimationFrame(() => latest(group));
   });
-  window.addEventListener('resize', () => requestAnimationFrame(() => groups.forEach(latest)));
-  window.addEventListener('pageshow', () => requestAnimationFrame(() => groups.forEach(latest)));
+  requestAnimationFrame(latestAll);
+  window.addEventListener('resize', () => requestAnimationFrame(latestAll));
+  window.addEventListener('pageshow', () => requestAnimationFrame(latestAll));
 })();
 </script>"""
 
